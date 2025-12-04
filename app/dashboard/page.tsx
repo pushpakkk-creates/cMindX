@@ -1,14 +1,14 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { db } from "../../lib/firebase";
+import { db } from "@/lib/firebase";
 import {
   collection,
   getDocs,
   query,
   orderBy,
   limit,
-  addDoc
+  addDoc,
 } from "firebase/firestore";
 
 type AnalyticsEvent = {
@@ -53,25 +53,23 @@ type AgentResponse = {
   ok: boolean;
   stats: SimpleStats[];
   suggestedVariant: AgentVariantSuggestion;
+  aiUsed?: string;
+  aiError?: string | null;
 };
 
 function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
-  const byVariant: Record<VariantId, AnalyticsEvent[]> = {
-    A: [],
-    B: []
-  };
+  const byVariant: Record<VariantId, AnalyticsEvent[]> = { A: [], B: [] };
 
   for (const e of events) {
-    const v = (e.variantId as VariantId | undefined) ?? "A";
-    if (v === "A" || v === "B") {
-      byVariant[v].push(e);
-    }
+    const v = (e.variantId as VariantId) ?? "A";
+    if (v === "A" || v === "B") byVariant[v].push(e);
   }
 
   const stats: VariantStats[] = [];
 
   for (const variantId of ["A", "B"] as VariantId[]) {
     const ve = byVariant[variantId];
+
     if (ve.length === 0) {
       stats.push({
         variantId,
@@ -79,7 +77,7 @@ function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
         sessions: 0,
         scrollEvents: 0,
         avgScrollPercent: null,
-        clickEvents: 0
+        clickEvents: 0,
       });
       continue;
     }
@@ -90,10 +88,10 @@ function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
     const scrollPercents = scrollEvents
       .map((e) => e.payload.scrollPercent as number | undefined)
       .filter((v): v is number => typeof v === "number");
+
     const avgScroll =
       scrollPercents.length > 0
-        ? scrollPercents.reduce((sum, v) => sum + v, 0) /
-          scrollPercents.length
+        ? scrollPercents.reduce((a, b) => a + b, 0) / scrollPercents.length
         : null;
 
     const clickEvents = ve.filter((e) => e.eventType === "click").length;
@@ -104,7 +102,7 @@ function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
       sessions: sessionSet.size,
       scrollEvents: scrollEvents.length,
       avgScrollPercent: avgScroll,
-      clickEvents
+      clickEvents,
     });
   }
 
@@ -123,12 +121,20 @@ export default function DashboardPage() {
   const [savedVariantId, setSavedVariantId] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // Filters + pagination for Recent Events
+  const [filterType, setFilterType] = useState<string>("all");
+  const [filterVariant, setFilterVariant] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [currentPage, setCurrentPage] = useState<number>(0);
+  const pageSize = 50;
+  const maxDisplayEvents = 200; // show only last 100 on the dashboard
+
   async function loadEvents() {
     try {
       const q = query(
         collection(db, "events"),
         orderBy("ts", "desc"),
-        limit(500)
+        limit(500) // fetch up to 500 latest events from Firestore
       );
       const snap = await getDocs(q);
       const loaded: AnalyticsEvent[] = snap.docs.map((doc) => {
@@ -138,12 +144,12 @@ export default function DashboardPage() {
           eventType: data.eventType ?? "unknown",
           payload: (data.payload ?? {}) as Record<string, unknown>,
           ts: data.ts ?? new Date().toISOString(),
-          variantId: data.variantId
+          variantId: data.variantId,
         };
       });
       setEvents(loaded);
     } catch (e) {
-      console.error("Failed to load events from Firestore", e);
+      console.error("Error loading events:", e);
     } finally {
       setLoading(false);
     }
@@ -158,9 +164,8 @@ export default function DashboardPage() {
 
       const res = await fetch("/api/agent");
       const json: AgentResponse = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error("Agent returned error");
-      }
+
+      if (!res.ok || !json.ok) throw new Error("Agent returned error");
       setAgentData(json);
     } catch (err) {
       console.error(err);
@@ -174,8 +179,9 @@ export default function DashboardPage() {
     if (!agentData?.suggestedVariant) return;
 
     try {
-      setSaveError(null);
       setSavingVariant(true);
+      setSaveError(null);
+      setSavedVariantId(null);
 
       const s = agentData.suggestedVariant;
 
@@ -185,11 +191,11 @@ export default function DashboardPage() {
         primaryCta: s.primaryCta,
         secondaryCta: s.secondaryCta,
         badge: s.badge,
-        status: "testing", // you can manually set to "active" later
+        status: "testing",
         createdBy: "ai",
         fromVariant: s.fromVariant,
         meta: s.meta,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
       });
 
       setSavedVariantId(docRef.id);
@@ -207,6 +213,12 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  // Reset page when filters/search change
+  useEffect(() => {
+    setCurrentPage(0);
+  }, [filterType, filterVariant, searchQuery]);
+
+  // Global stats use all loaded events (up to 500)
   const totalEvents = events.length;
   const uniqueSessions = new Set(events.map((e) => e.sessionId)).size;
   const variantStats = computeVariantStats(events);
@@ -220,144 +232,171 @@ export default function DashboardPage() {
         : variantStats[1].variantId
       : null;
 
+  // ---- Recent Events: only last 100, with filters + pagination ----
+
+  // latest first from Firestore; take only first 100
+  const baseEvents = events.slice(0, maxDisplayEvents);
+
+  const filteredEvents = baseEvents.filter((e) => {
+    // Filter by type
+    const typeOk =
+      filterType === "all"
+        ? true
+        : filterType === "other"
+        ? !["pageview", "click", "scroll"].includes(
+            e.eventType.toLowerCase()
+          )
+        : e.eventType.toLowerCase() === filterType;
+
+    // Filter by variant
+    const v = (e.variantId ?? "unknown").toUpperCase();
+    const variantOk =
+      filterVariant === "all"
+        ? true
+        : filterVariant === "unknown"
+        ? v !== "A" && v !== "B"
+        : v === filterVariant.toUpperCase();
+
+    // Search in payload JSON
+    const payloadString = JSON.stringify(e.payload ?? {}).toLowerCase();
+    const searchOk = searchQuery
+      ? payloadString.includes(searchQuery.toLowerCase())
+      : true;
+
+    return typeOk && variantOk && searchOk;
+  });
+
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredEvents.length / pageSize)
+  );
+  const safePage = Math.min(currentPage, totalPages - 1);
+  const startIndex = safePage * pageSize;
+  const pageEvents = filteredEvents.slice(
+    startIndex,
+    startIndex + pageSize
+  );
+
   return (
-    <div className="retro-bg min-h-screen text-slate-50">
-      <div className="mx-auto max-w-6xl px-4 pb-16 pt-6">
-        {/* Top HUD bar */}
-        <header className="mb-6 flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-slate-300">
+    <div className="min-h-screen bg-neutral-950 text-neutral-50">
+      <div className="mx-auto max-w-6xl px-5 py-6 space-y-8 md:px-8">
+        {/* HEADER */}
+        <header className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="pixel-border flex h-8 w-8 items-center justify-center rounded-md bg-gradient-to-br from-amber-500 to-rose-500 text-[10px] font-black">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md border border-neutral-800 text-[11px] font-semibold">
               HUD
             </div>
-            <div className="flex flex-col gap-1">
-              <span className="text-[11px] font-semibold text-slate-100">
-                cMindX Analytics HUD
-              </span>
-              <div className="flex gap-2 text-[9px] text-slate-400">
-                <span>MODE: LIVE TELEMETRY</span>
-                <span className="text-lime-300">
-                  EVENTS: {totalEvents}
-                </span>
-              </div>
+            <div>
+              <p className="text-sm font-semibold tracking-tight">
+                cMindX dashboard
+              </p>
+              <p className="text-xs text-neutral-500">
+                Live behaviour & variant performance
+              </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 text-[9px]">
-            <span className="inline-flex items-center gap-1 text-slate-400">
-              <span className="status-led" />
-              STREAM: ACTIVE
-            </span>
-            <a
-              href="/"
-              className="rounded-sm border border-slate-600 bg-slate-900/60 px-3 py-1 text-[9px] font-semibold text-slate-200 hover:border-amber-400 hover:text-amber-200"
-            >
-              ⬅ BACK TO AGENT
-            </a>
-          </div>
+          <a
+            href="/"
+            className="inline-flex items-center justify-center rounded-full border border-neutral-700 px-3 py-1.5 text-[11px] text-neutral-100 hover:border-neutral-400"
+          >
+            Back to site
+          </a>
         </header>
 
-        {loading && (
-          <p className="text-[11px] text-slate-300">Loading telemetry…</p>
-        )}
-
-        {!loading && (
+        {loading ? (
+          <p className="text-sm text-neutral-300">Loading telemetry…</p>
+        ) : (
           <>
-            {/* Top stats row */}
-            <section className="mb-8 grid gap-4 md:grid-cols-3 text-[11px]">
-              <div className="retro-panel scanline-overlay border border-slate-700/80 p-4">
-                <p className="text-[9px] uppercase tracking-[0.22em] text-slate-400">
-                  TOTAL EVENTS
+            {/* METRICS ROW */}
+            <section className="grid gap-4 md:grid-cols-3 text-sm">
+              <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-neutral-500">
+                  Total events
                 </p>
-                <p className="mt-2 text-2xl font-semibold text-amber-300">
+                <p className="mt-2 text-2xl font-semibold text-neutral-50">
                   {totalEvents}
                 </p>
-                <p className="mt-1 text-[9px] text-slate-500">
-                  Pageviews, clicks and scrolls captured for this build.
+                <p className="mt-1 text-xs text-neutral-500">
+                  Scrolls, clicks and pageviews combined.
                 </p>
               </div>
-
-              <div className="retro-panel scanline-overlay border border-slate-700/80 p-4">
-                <p className="text-[9px] uppercase tracking-[0.22em] text-slate-400">
-                  UNIQUE SESSIONS
+              <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-neutral-500">
+                  Unique sessions
                 </p>
-                <p className="mt-2 text-2xl font-semibold text-lime-300">
+                <p className="mt-2 text-2xl font-semibold text-neutral-50">
                   {uniqueSessions}
                 </p>
-                <p className="mt-1 text-[9px] text-slate-500">
-                  Distinct visitors represented in the event log.
+                <p className="mt-1 text-xs text-neutral-500">
+                  Distinct visitors based on sessionId.
                 </p>
               </div>
-
-              <div className="retro-panel scanline-overlay hud-pulse border border-amber-500/70 p-4">
-                <p className="text-[9px] uppercase tracking-[0.22em] text-slate-400">
-                  CURRENT WINNER
+              <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-neutral-500">
+                  Current winner
                 </p>
-                <p className="mt-2 text-2xl font-semibold text-amber-200">
-                  {winner ? `Variant ${winner}` : "—"}
+                <p className="mt-2 text-2xl font-semibold text-neutral-50">
+                  {winner ? `Variant ${winner}` : "Not enough data"}
                 </p>
-                <p className="mt-1 text-[9px] text-slate-500">
-                  Based on higher average scroll depth across sessions.
+                <p className="mt-1 text-xs text-neutral-500">
+                  Determined by higher average scroll depth.
                 </p>
               </div>
             </section>
 
-            {/* Variant performance cards */}
-            <section className="mb-8">
-              <h2 className="mb-3 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-400">
-                VARIANT PERFORMANCE
+            {/* VARIANT PERFORMANCE */}
+            <section className="space-y-3">
+              <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
+                Variant performance
               </h2>
-              <div className="grid gap-4 md:grid-cols-2 text-[11px]">
-                {variantStats.map((vs) => (
+              <div className="grid gap-4 md:grid-cols-2 text-sm">
+                {variantStats.map((s) => (
                   <div
-                    key={vs.variantId}
-                    className="retro-panel scanline-overlay border border-slate-700/80 p-4"
+                    key={s.variantId}
+                    className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4"
                   >
                     <div className="mb-2 flex items-center justify-between">
-                      <p className="text-sm font-semibold text-slate-50">
-                        Variant {vs.variantId}
+                      <p className="text-sm font-semibold text-neutral-50">
+                        Variant {s.variantId}
                       </p>
-                      {winner === vs.variantId && (
-                        <span className="rounded-full bg-lime-400/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-lime-300">
-                          LEADING
+                      {winner === s.variantId && (
+                        <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-[10px] font-medium text-neutral-900">
+                          Leading
                         </span>
                       )}
                     </div>
-                    <p className="mb-3 text-[10px] text-slate-400">
-                      Hero copy + CTA version {vs.variantId}. Tracked using live
-                      scroll and click events.
-                    </p>
-
-                    <div className="grid grid-cols-2 gap-3 text-[11px]">
-                      <div className="rounded border border-slate-700 bg-slate-950/60 px-3 py-2">
-                        <p className="text-[9px] text-slate-400">SESSIONS</p>
-                        <p className="text-sm font-semibold text-slate-50">
-                          {vs.sessions}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <p className="text-[11px] text-neutral-500">
+                          Sessions
+                        </p>
+                        <p className="text-neutral-100">{s.sessions}</p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-neutral-500">
+                          Total events
+                        </p>
+                        <p className="text-neutral-100">
+                          {s.totalEvents}
                         </p>
                       </div>
-                      <div className="rounded border border-slate-700 bg-slate-950/60 px-3 py-2">
-                        <p className="text-[9px] text-slate-400">
-                          TOTAL EVENTS
+                      <div>
+                        <p className="text-[11px] text-neutral-500">
+                          Avg scroll
                         </p>
-                        <p className="text-sm font-semibold text-slate-50">
-                          {vs.totalEvents}
-                        </p>
-                      </div>
-                      <div className="rounded border border-slate-700 bg-slate-950/60 px-3 py-2">
-                        <p className="text-[9px] text-slate-400">
-                          AVG SCROLL
-                        </p>
-                        <p className="text-sm font-semibold text-amber-200">
-                          {vs.avgScrollPercent !== null
-                            ? `${vs.avgScrollPercent.toFixed(1)}%`
-                            : "—"}
+                        <p className="text-neutral-100">
+                          {s.avgScrollPercent !== null
+                            ? `${s.avgScrollPercent.toFixed(1)}%`
+                            : "–"}
                         </p>
                       </div>
-                      <div className="rounded border border-slate-700 bg-slate-950/60 px-3 py-2">
-                        <p className="text-[9px] text-slate-400">
-                          CLICK EVENTS
+                      <div>
+                        <p className="text-[11px] text-neutral-500">
+                          Click events
                         </p>
-                        <p className="text-sm font-semibold text-rose-200">
-                          {vs.clickEvents}
+                        <p className="text-neutral-100">
+                          {s.clickEvents}
                         </p>
                       </div>
                     </div>
@@ -367,199 +406,260 @@ export default function DashboardPage() {
             </section>
 
             {/* AI VARIANT LAB */}
-            <section className="mb-8">
-              <h2 className="mb-3 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-400">
-                AI VARIANT LAB
+            <section className="space-y-3">
+              <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
+                AI variant lab
               </h2>
-              <div className="retro-panel scanline-overlay border border-lime-500/60 p-4 text-[11px]">
-                <div className="mb-3 flex items-center justify-between">
+              <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4 text-sm">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p className="text-[9px] uppercase tracking-[0.22em] text-lime-300">
-                      EXPERIMENTAL AGENT
+                    <p className="text-sm font-medium text-neutral-200">
+                      Generate the next hero variant from live data
                     </p>
-                    <p className="text-xs font-semibold text-slate-50">
-                      Generate next hero variant from live data.
+                    <p className="text-xs text-neutral-500">
+                      The agent uses the same metrics as this dashboard to
+                      propose a new Build C.
                     </p>
                   </div>
                   <button
                     onClick={runAgent}
                     disabled={agentLoading}
-                    className="pixel-border rounded-md bg-lime-400 px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-950 hover:bg-lime-300 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="inline-flex items-center justify-center rounded-full border border-neutral-200 bg-neutral-50 px-4 py-1.5 text-[11px] font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-60"
                   >
-                    {agentLoading ? "RUNNING…" : "RUN AGENT"}
+                    {agentLoading ? "Running…" : "Run agent"}
                   </button>
                 </div>
 
                 {agentError && (
-                  <p className="text-[10px] text-rose-300">{agentError}</p>
+                  <p className="mt-2 text-xs text-red-400">{agentError}</p>
                 )}
 
-                {!agentError && agentData && (
-                  <div className="mt-3 grid gap-4 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
-                    <div className="rounded border border-slate-700 bg-slate-950/70 px-3 py-3">
-                      <p className="mb-1 text-[9px] text-slate-400 uppercase tracking-[0.22em]">
-                        SUMMARY
+                {agentData && !agentError && (
+                  <div className="mt-4 grid gap-4 md:grid-cols-2 text-xs">
+                    {/* Summary */}
+                    <div className="rounded-lg border border-neutral-800 bg-neutral-950/90 p-3">
+                      <p className="mb-2 text-[11px] uppercase tracking-[0.16em] text-neutral-500">
+                        Summary
                       </p>
-                      <p className="text-[10px] text-slate-300">
-                        Current strongest variant:&nbsp;
-                        <span className="font-semibold text-amber-200">
-                          {agentData.suggestedVariant.fromVariant}
-                        </span>
+                      <p className="text-neutral-300">
+                        Based on variant{" "}
+                          <span className="font-medium text-neutral-100">
+                            {agentData.suggestedVariant.fromVariant}
+                          </span>
                       </p>
                       {agentData.suggestedVariant.meta.basedOn && (
-                        <p className="mt-1 text-[10px] text-slate-400">
-                          Based on avg scroll&nbsp;
-                          <span className="text-amber-200">
+                        <p className="mt-1 text-neutral-400">
+                          Scroll:{" "}
+                          <span className="text-neutral-100">
                             {agentData.suggestedVariant.meta.basedOn.avgScroll?.toFixed(
                               1
-                            ) ?? "—"}
+                            ) ?? "–"}
                             %
-                          </span>
-                          &nbsp;and&nbsp;
-                          <span className="text-rose-200">
-                            {agentData.suggestedVariant.meta.basedOn.clicks}
                           </span>{" "}
-                          clicks.
+                          · Clicks:{" "}
+                          <span className="text-neutral-100">
+                            {
+                              agentData.suggestedVariant.meta.basedOn
+                                .clicks
+                            }
+                          </span>
+                        </p>
+                      )}
+                      <p className="mt-2 text-neutral-500">
+                        Source:{" "}
+                        <span className="text-neutral-200">
+                          {agentData.aiUsed === "gemini"
+                            ? "Gemini"
+                            : "Heuristic"}
+                        </span>
+                      </p>
+                      {agentData.aiError && (
+                        <p className="mt-1 text-neutral-500">
+                          {agentData.aiError}
                         </p>
                       )}
                     </div>
 
-                    <div className="rounded border border-slate-700 bg-slate-950/70 px-3 py-3">
-                      <p className="mb-1 text-[9px] text-slate-400 uppercase tracking-[0.22em]">
-                        PROPOSED BUILD C
+                    {/* Proposed variant */}
+                    <div className="rounded-lg border border-neutral-800 bg-neutral-950/90 p-3">
+                      <p className="mb-2 text-[11px] uppercase tracking-[0.16em] text-neutral-500">
+                        Proposed variant
                       </p>
-                      <p className="text-xs font-semibold text-slate-50">
+                      <p className="text-neutral-100 font-semibold">
                         {agentData.suggestedVariant.heroTitle}
                       </p>
-                      <p className="mt-1 text-[10px] text-slate-300">
+                      <p className="mt-2 text-neutral-400">
                         {agentData.suggestedVariant.heroSubtitle}
                       </p>
-                      <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
-                        <span className="rounded-full border border-lime-400/60 px-2 py-1 text-lime-300">
+                      <p className="mt-3 text-neutral-500">
+                        Primary CTA:{" "}
+                        <span className="text-neutral-200">
                           {agentData.suggestedVariant.primaryCta}
                         </span>
-                        <span className="rounded-full border border-slate-600 px-2 py-1 text-slate-200">
+                      </p>
+                      <p className="text-neutral-500">
+                        Secondary CTA:{" "}
+                        <span className="text-neutral-200">
                           {agentData.suggestedVariant.secondaryCta}
                         </span>
-                        <span className="rounded-full border border-amber-500/60 px-2 py-1 text-amber-300">
+                      </p>
+                      <p className="mt-1 text-neutral-500">
+                        Badge:{" "}
+                        <span className="text-neutral-200">
                           {agentData.suggestedVariant.badge}
                         </span>
-                      </div>
-                      <p className="mt-2 text-[10px] text-slate-400">
-                        {agentData.suggestedVariant.meta.explanation}
                       </p>
-
-                      <div className="mt-3 flex flex-wrap items-center gap-3">
-                        <button
-                          onClick={saveSuggestedVariant}
-                          disabled={savingVariant}
-                          className="pixel-border rounded-md bg-amber-400 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-950 hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          {savingVariant ? "SAVING…" : "SAVE AS VARIANT"}
-                        </button>
-                        {savedVariantId && (
-                          <span className="text-[10px] text-lime-300">
-                            Saved to Firestore as: {savedVariantId}
-                          </span>
-                        )}
-                        {saveError && (
-                          <span className="text-[10px] text-rose-300">
-                            {saveError}
-                          </span>
-                        )}
-                      </div>
                     </div>
                   </div>
                 )}
 
-                {!agentData && !agentLoading && !agentError && (
-                  <p className="mt-2 text-[10px] text-slate-400">
-                    Click <span className="text-lime-300">RUN AGENT</span> to
-                    analyze A/B performance and propose the next hero variant
-                    (Build C). You can then save it into Firestore as an
-                    AI-generated variant.
+                {agentData && (
+                  <div className="mt-4 flex justify-end">
+                    <button
+                      onClick={saveSuggestedVariant}
+                      disabled={savingVariant}
+                      className="inline-flex items-center justify-center rounded-full border border-neutral-200 bg-neutral-50 px-4 py-1.5 text-[11px] font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-60"
+                    >
+                      {savingVariant ? "Saving…" : "Save as variant"}
+                    </button>
+                  </div>
+                )}
+
+                {savedVariantId && (
+                  <p className="mt-2 text-xs text-green-400">
+                    Saved! Variant ID: {savedVariantId}
                   </p>
+                )}
+                {saveError && (
+                  <p className="mt-2 text-xs text-red-400">{saveError}</p>
                 )}
               </div>
             </section>
 
-            {/* Recent events table */}
-            <section>
-              <h2 className="mb-3 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-400">
-                LIVE EVENT LOG
-              </h2>
-              <div className="retro-panel scanline-overlay border border-slate-700/80 p-3">
-                <div className="mb-2 flex items-center justify-between text-[9px] text-slate-400">
-                  <span>/firestore/events</span>
-                  <span className="hud-scan text-lime-300">
-                    STREAM • REFRESHING EVERY 5s
-                  </span>
+            {/* RECENT EVENTS WITH FILTERS + PAGINATION */}
+            <section className="mb-10 space-y-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
+                  Recent events (latest {maxDisplayEvents})
+                </h2>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <select
+                    value={filterType}
+                    onChange={(e) => setFilterType(e.target.value)}
+                    className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-200"
+                  >
+                    <option value="all">All types</option>
+                    <option value="pageview">Pageview</option>
+                    <option value="click">Click</option>
+                    <option value="scroll">Scroll</option>
+                    <option value="other">Other</option>
+                  </select>
+
+                  <select
+                    value={filterVariant}
+                    onChange={(e) => setFilterVariant(e.target.value)}
+                    className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-200"
+                  >
+                    <option value="all">All variants</option>
+                    <option value="A">Variant A</option>
+                    <option value="B">Variant B</option>
+                    <option value="unknown">Unknown</option>
+                  </select>
+
+                  <input
+                    type="text"
+                    placeholder="Search payload…"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-200"
+                  />
                 </div>
-                <div className="overflow-auto rounded-md border border-slate-800 bg-black/60">
-                  <table className="w-full text-left text-[10px]">
-                    <thead className="bg-slate-900/80 text-slate-400">
-                      <tr>
-                        <th className="px-3 py-2">Time</th>
-                        <th className="px-3 py-2">Session</th>
-                        <th className="px-3 py-2">Variant</th>
-                        <th className="px-3 py-2">Type</th>
-                        <th className="px-3 py-2">Details</th>
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-950/80">
+                <table className="min-w-full text-left text-xs text-neutral-300">
+                  <thead className="border-b border-neutral-800 bg-neutral-900">
+                    <tr>
+                      <th className="px-4 py-2">Time</th>
+                      <th className="px-4 py-2">Type</th>
+                      <th className="px-4 py-2">Variant</th>
+                      <th className="px-4 py-2">Payload</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageEvents.map((e, i) => (
+                      <tr
+                        key={i}
+                        className="border-b border-neutral-900 hover:bg-neutral-900/50"
+                      >
+                        <td className="px-4 py-2 text-neutral-400">
+                          {new Date(e.ts).toLocaleString()}
+                        </td>
+                        <td className="px-4 py-2">{e.eventType}</td>
+                        <td className="px-4 py-2">{e.variantId ?? "—"}</td>
+                        <td className="px-4 py-2 text-neutral-400">
+                          {JSON.stringify(e.payload)}
+                        </td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {events.map((e, idx) => (
-                        <tr
-                          key={`${e.ts}-${idx}`}
-                          className="border-t border-slate-800/80"
+                    ))}
+                    {pageEvents.length === 0 && (
+                      <tr>
+                        <td
+                          className="px-4 py-4 text-center text-neutral-500"
+                          colSpan={4}
                         >
-                          <td className="px-3 py-2 text-slate-300">
-                            {new Date(e.ts).toLocaleTimeString()}
-                          </td>
-                          <td className="px-3 py-2 text-slate-400">
-                            {e.sessionId.slice(0, 8)}…
-                          </td>
-                          <td className="px-3 py-2 text-slate-300">
-                            {e.variantId ?? "—"}
-                          </td>
-                          <td className="px-3 py-2">
-                            <span
-                              className={[
-                                "rounded-full px-2 py-0.5 text-[9px] uppercase tracking-wide",
-                                e.eventType === "click"
-                                  ? "bg-rose-500/20 text-rose-200"
-                                  : e.eventType === "scroll"
-                                  ? "bg-amber-500/20 text-amber-200"
-                                  : "bg-slate-700/50 text-slate-100"
-                              ].join(" ")}
-                            >
-                              {e.eventType}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-slate-300">
-                            {e.eventType === "scroll" &&
-                              `Scroll: ${e.payload.scrollPercent}%`}
-                            {e.eventType === "click" &&
-                              `Click on ${e.payload.tag} "${
-                                (e.payload.text as string) || ""
-                              }"`}
-                            {e.eventType === "pageview" &&
-                              `Path: ${e.payload.path}`}
-                          </td>
-                        </tr>
-                      ))}
-                      {events.length === 0 && (
-                        <tr>
-                          <td
-                            colSpan={5}
-                            className="px-3 py-4 text-center text-slate-400"
-                          >
-                            No events yet. Open the main page, scroll and click
-                            to generate telemetry.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
+                          No events matching current filters.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between text-xs text-neutral-500">
+                <span>
+                  Showing{" "}
+                  <span className="text-neutral-200">
+                    {pageEvents.length}
+                  </span>{" "}
+                  of{" "}
+                  <span className="text-neutral-200">
+                    {filteredEvents.length}
+                  </span>{" "}
+                  filtered events
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() =>
+                      setCurrentPage((p) => Math.max(0, p - 1))
+                    }
+                    disabled={safePage === 0}
+                    className="rounded-full border border-neutral-700 px-2 py-1 text-[11px] text-neutral-200 disabled:opacity-40"
+                  >
+                    Prev
+                  </button>
+                  <span>
+                    Page{" "}
+                    <span className="text-neutral-200">
+                      {safePage + 1}
+                    </span>{" "}
+                    /{" "}
+                    <span className="text-neutral-200">
+                      {totalPages}
+                    </span>
+                  </span>
+                  <button
+                    onClick={() =>
+                      setCurrentPage((p) =>
+                        Math.min(totalPages - 1, p + 1)
+                      )
+                    }
+                    disabled={safePage >= totalPages - 1}
+                    className="rounded-full border border-neutral-700 px-2 py-1 text-[11px] text-neutral-200 disabled:opacity-40"
+                  >
+                    Next
+                  </button>
                 </div>
               </div>
             </section>
