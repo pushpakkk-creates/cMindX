@@ -29,6 +29,31 @@ type VariantStats = {
   clickEvents: number;
 };
 
+type SimpleStats = {
+  variantId: VariantId;
+  avgScroll: number | null;
+  clicks: number;
+};
+
+type AgentVariantSuggestion = {
+  fromVariant: VariantId;
+  heroTitle: string;
+  heroSubtitle: string;
+  primaryCta: string;
+  secondaryCta: string;
+  badge: string;
+  meta: {
+    basedOn: SimpleStats | null;
+    explanation: string;
+  };
+};
+
+type AgentResponse = {
+  ok: boolean;
+  stats: SimpleStats[];
+  suggestedVariant: AgentVariantSuggestion;
+};
+
 function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
   const byVariant: Record<VariantId, AnalyticsEvent[]> = {
     A: [],
@@ -89,7 +114,11 @@ export default function DashboardPage() {
   const [events, setEvents] = useState<AnalyticsEvent[]>([]);
   const [loading, setLoading] = useState(true);
 
-  async function load() {
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentData, setAgentData] = useState<AgentResponse | null>(null);
+  const [agentError, setAgentError] = useState<string | null>(null);
+
+  async function loadEvents() {
     try {
       const q = query(
         collection(db, "events"),
@@ -115,9 +144,27 @@ export default function DashboardPage() {
     }
   }
 
+  async function runAgent() {
+    try {
+      setAgentError(null);
+      setAgentLoading(true);
+      const res = await fetch("/api/agent");
+      const json: AgentResponse = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error("Agent returned error");
+      }
+      setAgentData(json);
+    } catch (err) {
+      console.error(err);
+      setAgentError("Agent failed to generate a suggestion.");
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
   useEffect(() => {
-    load();
-    const id = setInterval(load, 5000);
+    loadEvents();
+    const id = setInterval(loadEvents, 5000);
     return () => clearInterval(id);
   }, []);
 
@@ -280,6 +327,102 @@ export default function DashboardPage() {
               </div>
             </section>
 
+            {/* AI VARIANT LAB */}
+            <section className="mb-8">
+              <h2 className="mb-3 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-400">
+                AI VARIANT LAB
+              </h2>
+              <div className="retro-panel scanline-overlay border border-lime-500/60 p-4 text-[11px]">
+                <div className="mb-3 flex items-center justify-between">
+                  <div>
+                    <p className="text-[9px] uppercase tracking-[0.22em] text-lime-300">
+                      EXPERIMENTAL AGENT
+                    </p>
+                    <p className="text-xs font-semibold text-slate-50">
+                      Generate next hero variant from live data.
+                    </p>
+                  </div>
+                  <button
+                    onClick={runAgent}
+                    disabled={agentLoading}
+                    className="pixel-border rounded-md bg-lime-400 px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-950 hover:bg-lime-300 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {agentLoading ? "RUNNING…" : "RUN AGENT"}
+                  </button>
+                </div>
+
+                {agentError && (
+                  <p className="text-[10px] text-rose-300">{agentError}</p>
+                )}
+
+                {!agentError && agentData && (
+                  <div className="mt-3 grid gap-4 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+                    <div className="rounded border border-slate-700 bg-slate-950/70 px-3 py-3">
+                      <p className="mb-1 text-[9px] text-slate-400 uppercase tracking-[0.22em]">
+                        SUMMARY
+                      </p>
+                      <p className="text-[10px] text-slate-300">
+                        Current strongest variant:&nbsp;
+                        <span className="font-semibold text-amber-200">
+                          {agentData.suggestedVariant.fromVariant}
+                        </span>
+                      </p>
+                      {agentData.suggestedVariant.meta.basedOn && (
+                        <p className="mt-1 text-[10px] text-slate-400">
+                          Based on avg scroll&nbsp;
+                          <span className="text-amber-200">
+                            {agentData.suggestedVariant.meta.basedOn.avgScroll?.toFixed(
+                              1
+                            ) ?? "—"}
+                            %
+                          </span>
+                          &nbsp;and&nbsp;
+                          <span className="text-rose-200">
+                            {agentData.suggestedVariant.meta.basedOn.clicks}
+                          </span>{" "}
+                          clicks.
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="rounded border border-slate-700 bg-slate-950/70 px-3 py-3">
+                      <p className="mb-1 text-[9px] text-slate-400 uppercase tracking-[0.22em]">
+                        PROPOSED BUILD C
+                      </p>
+                      <p className="text-xs font-semibold text-slate-50">
+                        {agentData.suggestedVariant.heroTitle}
+                      </p>
+                      <p className="mt-1 text-[10px] text-slate-300">
+                        {agentData.suggestedVariant.heroSubtitle}
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                        <span className="rounded-full border border-lime-400/60 px-2 py-1 text-lime-300">
+                          {agentData.suggestedVariant.primaryCta}
+                        </span>
+                        <span className="rounded-full border border-slate-600 px-2 py-1 text-slate-200">
+                          {agentData.suggestedVariant.secondaryCta}
+                        </span>
+                        <span className="rounded-full border border-amber-500/60 px-2 py-1 text-amber-300">
+                          {agentData.suggestedVariant.badge}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-[10px] text-slate-400">
+                        {agentData.suggestedVariant.meta.explanation}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {!agentData && !agentLoading && !agentError && (
+                  <p className="mt-2 text-[10px] text-slate-400">
+                    Click <span className="text-lime-300">RUN AGENT</span> to
+                    analyze current A/B performance and propose the next hero
+                    variant (Build C).
+                  </p>
+                )}
+              </div>
+            </section>
+
             {/* Recent events table */}
             <section>
               <h2 className="mb-3 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-400">
@@ -304,7 +447,7 @@ export default function DashboardPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {events.slice(0, 80).map((e, idx) => (
+                      {events.map((e, idx) => (
                         <tr
                           key={`${e.ts}-${idx}`}
                           className="border-t border-slate-800/80"
