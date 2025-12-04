@@ -7,7 +7,8 @@ import {
   getDocs,
   query,
   orderBy,
-  limit
+  limit,
+  addDoc
 } from "firebase/firestore";
 
 type AnalyticsEvent = {
@@ -118,12 +119,16 @@ export default function DashboardPage() {
   const [agentData, setAgentData] = useState<AgentResponse | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
 
+  const [savingVariant, setSavingVariant] = useState(false);
+  const [savedVariantId, setSavedVariantId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   async function loadEvents() {
     try {
       const q = query(
         collection(db, "events"),
         orderBy("ts", "desc"),
-        limit(200)
+        limit(500)
       );
       const snap = await getDocs(q);
       const loaded: AnalyticsEvent[] = snap.docs.map((doc) => {
@@ -148,6 +153,9 @@ export default function DashboardPage() {
     try {
       setAgentError(null);
       setAgentLoading(true);
+      setSavedVariantId(null);
+      setSaveError(null);
+
       const res = await fetch("/api/agent");
       const json: AgentResponse = await res.json();
       if (!res.ok || !json.ok) {
@@ -159,6 +167,37 @@ export default function DashboardPage() {
       setAgentError("Agent failed to generate a suggestion.");
     } finally {
       setAgentLoading(false);
+    }
+  }
+
+  async function saveSuggestedVariant() {
+    if (!agentData?.suggestedVariant) return;
+
+    try {
+      setSaveError(null);
+      setSavingVariant(true);
+
+      const s = agentData.suggestedVariant;
+
+      const docRef = await addDoc(collection(db, "variants"), {
+        heroTitle: s.heroTitle,
+        heroSubtitle: s.heroSubtitle,
+        primaryCta: s.primaryCta,
+        secondaryCta: s.secondaryCta,
+        badge: s.badge,
+        status: "testing", // you can manually set to "active" later
+        createdBy: "ai",
+        fromVariant: s.fromVariant,
+        meta: s.meta,
+        createdAt: new Date().toISOString()
+      });
+
+      setSavedVariantId(docRef.id);
+    } catch (e) {
+      console.error(e);
+      setSaveError("Failed to save variant.");
+    } finally {
+      setSavingVariant(false);
     }
   }
 
@@ -409,6 +448,26 @@ export default function DashboardPage() {
                       <p className="mt-2 text-[10px] text-slate-400">
                         {agentData.suggestedVariant.meta.explanation}
                       </p>
+
+                      <div className="mt-3 flex flex-wrap items-center gap-3">
+                        <button
+                          onClick={saveSuggestedVariant}
+                          disabled={savingVariant}
+                          className="pixel-border rounded-md bg-amber-400 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-950 hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {savingVariant ? "SAVING…" : "SAVE AS VARIANT"}
+                        </button>
+                        {savedVariantId && (
+                          <span className="text-[10px] text-lime-300">
+                            Saved to Firestore as: {savedVariantId}
+                          </span>
+                        )}
+                        {saveError && (
+                          <span className="text-[10px] text-rose-300">
+                            {saveError}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
@@ -416,8 +475,9 @@ export default function DashboardPage() {
                 {!agentData && !agentLoading && !agentError && (
                   <p className="mt-2 text-[10px] text-slate-400">
                     Click <span className="text-lime-300">RUN AGENT</span> to
-                    analyze current A/B performance and propose the next hero
-                    variant (Build C).
+                    analyze A/B performance and propose the next hero variant
+                    (Build C). You can then save it into Firestore as an
+                    AI-generated variant.
                   </p>
                 )}
               </div>
