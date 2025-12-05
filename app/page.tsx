@@ -5,15 +5,74 @@ import { useAnalytics } from "@/hooks/useAnalytics";
 
 type VariantId = "A" | "B";
 
+type HeroContent = {
+  heroTitle: string;
+  heroSubtitle: string;
+  primaryCta: string;
+  secondaryCta: string;
+};
+
+// Base hero content = exactly what you had before
+const BASE_HERO: HeroContent = {
+  heroTitle: "A landing page that rewrites itself from live behaviour.",
+  heroSubtitle:
+    "Instead of shipping static copy, cMindX watches how visitors scroll, click and drop off — then quietly evolves your hero, CTAs and above-the-fold layout based on what actually performs.",
+  primaryCta: "View live dashboard",
+  secondaryCta: "See how it works",
+};
+
 export default function Home() {
   const [variantId, setVariantId] = useState<VariantId>("A");
 
+  // optional override from Firestore live variant
+  const [heroOverride, setHeroOverride] = useState<HeroContent | null>(null);
+  const [usingLiveVariant, setUsingLiveVariant] = useState(false);
+
+  // A/B assignment (for analytics)
   useEffect(() => {
     const v: VariantId = Math.random() < 0.5 ? "A" : "B";
     setVariantId(v);
   }, []);
 
+  // Send analytics tagged with A/B variant
   useAnalytics(variantId);
+
+  // Fetch live variant (if any) once on mount
+  useEffect(() => {
+    async function fetchActiveVariant() {
+      try {
+        const res = await fetch("/api/active-variant");
+        if (!res.ok) return;
+        const json = await res.json();
+
+        if (json.ok && json.variant) {
+          const v = json.variant;
+          // expect heroTitle, heroSubtitle, primaryCta, secondaryCta in Firestore doc
+          if (
+            v.heroTitle &&
+            v.heroSubtitle &&
+            v.primaryCta &&
+            v.secondaryCta
+          ) {
+            setHeroOverride({
+              heroTitle: v.heroTitle,
+              heroSubtitle: v.heroSubtitle,
+              primaryCta: v.primaryCta,
+              secondaryCta: v.secondaryCta,
+            });
+            setUsingLiveVariant(true);
+          }
+        }
+      } catch (e) {
+        // ignore errors silently on client
+        console.error("active-variant fetch error", e);
+      }
+    }
+
+    fetchActiveVariant();
+  }, []);
+
+  const hero = heroOverride ?? BASE_HERO;
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-50">
@@ -30,6 +89,7 @@ export default function Home() {
               </span>
               <span className="text-[11px] text-neutral-500">
                 Self-evolving website agent · Variant {variantId}
+                {usingLiveVariant && " · Live AI copy"}
               </span>
             </div>
           </div>
@@ -62,13 +122,12 @@ export default function Home() {
             </p>
 
             <h1 className="text-4xl font-semibold leading-tight tracking-tight text-neutral-50 md:text-5xl">
-              A landing page that rewrites itself from live behaviour.
+              {hero.heroTitle}
             </h1>
 
             <p className="max-w-xl text-sm leading-relaxed text-neutral-300 md:text-[15px]">
-              Instead of shipping static copy, cMindX watches how visitors
-              scroll, click and drop off — then quietly evolves your hero,
-              CTAs and above-the-fold layout based on what actually performs.
+
+              {hero.heroSubtitle}
             </p>
 
             <div className="flex flex-wrap items-center gap-3 pt-2">
@@ -76,13 +135,13 @@ export default function Home() {
                 href="/dashboard"
                 className="inline-flex items-center justify-center rounded-full bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 shadow-sm hover:bg-neutral-200"
               >
-                View live dashboard
+                {hero.primaryCta}
               </a>
               <a
                 href="#how"
                 className="inline-flex items-center justify-center rounded-full border border-neutral-700 px-4 py-2 text-sm font-medium text-neutral-100 hover:border-neutral-400"
               >
-                See how it works
+                {hero.secondaryCta}
               </a>
             </div>
 

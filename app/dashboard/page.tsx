@@ -9,6 +9,7 @@ import {
   orderBy,
   limit,
   addDoc,
+  writeBatch,
 } from "firebase/firestore";
 
 type AnalyticsEvent = {
@@ -56,6 +57,8 @@ type AgentResponse = {
   aiUsed?: string;
   aiError?: string | null;
 };
+
+/** --- helpers --- **/
 
 function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
   const byVariant: Record<VariantId, AnalyticsEvent[]> = { A: [], B: [] };
@@ -109,6 +112,8 @@ function computeVariantStats(events: AnalyticsEvent[]): VariantStats[] {
   return stats;
 }
 
+/** --- component --- **/
+
 export default function DashboardPage() {
   const [events, setEvents] = useState<AnalyticsEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -121,20 +126,36 @@ export default function DashboardPage() {
   const [savedVariantId, setSavedVariantId] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  // Filters + pagination for Recent Events
+
+  const [promoting, setPromoting] = useState(false);
+  const [promoteMessage, setPromoteMessage] = useState<string | null>(null);
+  const [promoteError, setPromoteError] = useState<string | null>(null);
+
+  const [disablingLive, setDisablingLive] = useState(false);
+  const [disableMessage, setDisableMessage] = useState<string | null>(null);
+  const [disableError, setDisableError] = useState<string | null>(null);
+
+
+  // filters + pagination for events
   const [filterType, setFilterType] = useState<string>("all");
   const [filterVariant, setFilterVariant] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [currentPage, setCurrentPage] = useState<number>(0);
-  const pageSize = 50;
-  const maxDisplayEvents = 200; // show only last 100 on the dashboard
+  const pageSize = 25;
+  const maxDisplayEvents = 100;
+
+  const [personaGenerating, setPersonaGenerating] = useState(false);
+  const [personaSlug, setPersonaSlug] = useState<string | null>(null);
+  const [personaError, setPersonaError] = useState<string | null>(null);
+
+  /** --- data loading --- **/
 
   async function loadEvents() {
     try {
       const q = query(
         collection(db, "events"),
         orderBy("ts", "desc"),
-        limit(500) // fetch up to 500 latest events from Firestore
+        limit(500)
       );
       const snap = await getDocs(q);
       const loaded: AnalyticsEvent[] = snap.docs.map((doc) => {
@@ -161,6 +182,8 @@ export default function DashboardPage() {
       setAgentLoading(true);
       setSavedVariantId(null);
       setSaveError(null);
+      setPromoteMessage(null);
+      setPromoteError(null);
 
       const res = await fetch("/api/agent");
       const json: AgentResponse = await res.json();
@@ -182,6 +205,8 @@ export default function DashboardPage() {
       setSavingVariant(true);
       setSaveError(null);
       setSavedVariantId(null);
+      setPromoteMessage(null);
+      setPromoteError(null);
 
       const s = agentData.suggestedVariant;
 
@@ -207,18 +232,85 @@ export default function DashboardPage() {
     }
   }
 
+  async function promoteLastSavedVariant() {
+    if (!savedVariantId) return;
+
+    try {
+      setPromoting(true);
+      setPromoteError(null);
+      setPromoteMessage(null);
+
+      const variantsRef = collection(db, "variants");
+      const snap = await getDocs(variantsRef);
+      const batch = writeBatch(db);
+
+      snap.forEach((docSnap) => {
+        const isTarget = docSnap.id === savedVariantId;
+        batch.update(docSnap.ref, {
+          status: isTarget ? "live" : "archived",
+        });
+      });
+
+      await batch.commit();
+      setPromoteMessage(
+        "Variant promoted to live. New visitors will see it once the landing page fetches it."
+      );
+    } catch (e) {
+      console.error(e);
+      setPromoteError("Failed to promote variant to live.");
+    } finally {
+      setPromoting(false);
+    }
+  }
+
+
+async function disableLiveVariants() {
+  try {
+    setDisablingLive(true);
+    setDisableError(null);
+    setDisableMessage(null);
+
+    const variantsRef = collection(db, "variants");
+    const snap = await getDocs(variantsRef);
+
+    let foundLive = 0;
+    const batch = writeBatch(db);
+
+    snap.forEach((docSnap) => {
+      const data = docSnap.data();
+      if (data.status === "live") {
+        foundLive++;
+        batch.update(docSnap.ref, { status: "archived" });
+      }
+    });
+
+    if (foundLive === 0) {
+      setDisableMessage("No live variant was active.");
+    } else {
+      await batch.commit();
+      setDisableMessage("Live AI copy disabled. A/B mode restored.");
+    }
+  } catch (e) {
+    console.error(e);
+    setDisableError("Failed to disable live AI copy.");
+  } finally {
+    setDisablingLive(false);
+  }
+}
+
+
   useEffect(() => {
     loadEvents();
     const id = setInterval(loadEvents, 5000);
     return () => clearInterval(id);
   }, []);
 
-  // Reset page when filters/search change
   useEffect(() => {
     setCurrentPage(0);
   }, [filterType, filterVariant, searchQuery]);
 
-  // Global stats use all loaded events (up to 500)
+  /** --- derived stats --- **/
+
   const totalEvents = events.length;
   const uniqueSessions = new Set(events.map((e) => e.sessionId)).size;
   const variantStats = computeVariantStats(events);
@@ -232,13 +324,10 @@ export default function DashboardPage() {
         : variantStats[1].variantId
       : null;
 
-  // ---- Recent Events: only last 100, with filters + pagination ----
-
-  // latest first from Firestore; take only first 100
+  // recent events (max 100) with filters + pagination
   const baseEvents = events.slice(0, maxDisplayEvents);
 
   const filteredEvents = baseEvents.filter((e) => {
-    // Filter by type
     const typeOk =
       filterType === "all"
         ? true
@@ -248,7 +337,6 @@ export default function DashboardPage() {
           )
         : e.eventType.toLowerCase() === filterType;
 
-    // Filter by variant
     const v = (e.variantId ?? "unknown").toUpperCase();
     const variantOk =
       filterVariant === "all"
@@ -257,7 +345,6 @@ export default function DashboardPage() {
         ? v !== "A" && v !== "B"
         : v === filterVariant.toUpperCase();
 
-    // Search in payload JSON
     const payloadString = JSON.stringify(e.payload ?? {}).toLowerCase();
     const searchOk = searchQuery
       ? payloadString.includes(searchQuery.toLowerCase())
@@ -276,6 +363,8 @@ export default function DashboardPage() {
     startIndex,
     startIndex + pageSize
   );
+
+  /** --- render --- **/
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-50">
@@ -308,7 +397,7 @@ export default function DashboardPage() {
           <p className="text-sm text-neutral-300">Loading telemetry…</p>
         ) : (
           <>
-            {/* METRICS ROW */}
+            {/* METRICS */}
             <section className="grid gap-4 md:grid-cols-3 text-sm">
               <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4">
                 <p className="text-[11px] uppercase tracking-[0.16em] text-neutral-500">
@@ -410,6 +499,7 @@ export default function DashboardPage() {
               <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
                 AI variant lab
               </h2>
+
               <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4 text-sm">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
@@ -443,9 +533,9 @@ export default function DashboardPage() {
                       </p>
                       <p className="text-neutral-300">
                         Based on variant{" "}
-                          <span className="font-medium text-neutral-100">
-                            {agentData.suggestedVariant.fromVariant}
-                          </span>
+                        <span className="font-medium text-neutral-100">
+                          {agentData.suggestedVariant.fromVariant}
+                        </span>
                       </p>
                       {agentData.suggestedVariant.meta.basedOn && (
                         <p className="mt-1 text-neutral-400">
@@ -513,8 +603,9 @@ export default function DashboardPage() {
                   </div>
                 )}
 
-                {agentData && (
-                  <div className="mt-4 flex justify-end">
+                {/* Save + Promote */}
+                <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
+                  {agentData && (
                     <button
                       onClick={saveSuggestedVariant}
                       disabled={savingVariant}
@@ -522,21 +613,137 @@ export default function DashboardPage() {
                     >
                       {savingVariant ? "Saving…" : "Save as variant"}
                     </button>
-                  </div>
-                )}
+                  )}
+
+                  {savedVariantId && (
+                    <button
+                      onClick={promoteLastSavedVariant}
+                      disabled={promoting}
+                      className="inline-flex items-center justify-center rounded-full border border-emerald-300 bg-emerald-300 px-4 py-1.5 text-[11px] font-medium text-emerald-950 hover:bg-emerald-200 disabled:opacity-60"
+                    >
+                      {promoting ? "Promoting…" : "Promote to live"}
+                    </button>
+                  )}
+                </div>
+
+                  <section className="space-y-3">
+  <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
+    Agentic persona pages
+  </h2>
+
+  <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4 text-sm">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <p className="text-sm font-medium text-neutral-200">
+          Generate a new persona-specific page
+        </p>
+        <p className="text-xs text-neutral-500">
+          Uses recent behaviour data to infer a dominant persona and build a dedicated page for them.
+        </p>
+      </div>
+
+      <button
+        onClick={async () => {
+          try {
+            setPersonaGenerating(true);
+            setPersonaError(null);
+            setPersonaSlug(null);
+
+            const res = await fetch("/api/persona-page", {
+              method: "POST",
+            });
+            const json = await res.json();
+
+            if (!json.ok) {
+              throw new Error(json.error || "Failed");
+            }
+
+            setPersonaSlug(json.slug);
+          } catch (err) {
+            console.error(err);
+            setPersonaError("Failed to generate persona page.");
+          } finally {
+            setPersonaGenerating(false);
+          }
+        }}
+        disabled={personaGenerating}
+        className="inline-flex items-center justify-center rounded-full border border-neutral-200 bg-neutral-50 px-4 py-1.5 text-[11px] font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-60"
+      >
+        {personaGenerating ? "Generating…" : "Generate persona page"}
+      </button>
+    </div>
+
+    {personaSlug && (
+      <p className="mt-2 text-xs text-neutral-400">
+        Persona page created:{" "}
+        <a
+          href={`/persona/${personaSlug}`}
+          className="text-neutral-100 underline underline-offset-2"
+        >
+          /persona/{personaSlug}
+        </a>
+      </p>
+    )}
+
+    {personaError && (
+      <p className="mt-2 text-xs text-red-400">{personaError}</p>
+    )}
+  </div>
+</section>
+
+                {/* Disable Live AI Copy */}
+<div className="mt-3 flex justify-end">
+  <button
+    onClick={disableLiveVariants}
+    disabled={disablingLive}
+    className="inline-flex items-center justify-center rounded-full border border-neutral-700 px-4 py-1.5 text-[11px] text-neutral-200 hover:border-neutral-400 disabled:opacity-60"
+  >
+    {disablingLive ? "Disabling…" : "Disable live AI copy"}
+  </button>
+</div>
+
+{/* Disable messages */}
+{disableMessage && (
+  <p className="mt-1 text-xs text-neutral-400">{disableMessage}</p>
+)}
+{disableError && (
+  <p className="mt-1 text-xs text-red-400">{disableError}</p>
+)}
+
 
                 {savedVariantId && (
-                  <p className="mt-2 text-xs text-green-400">
-                    Saved! Variant ID: {savedVariantId}
+                  <p className="mt-2 text-xs text-neutral-400">
+                    Saved variant ID:{" "}
+                    <span className="text-neutral-200">
+                      {savedVariantId}
+                    </span>
                   </p>
                 )}
                 {saveError && (
-                  <p className="mt-2 text-xs text-red-400">{saveError}</p>
+                  <p className="mt-1 text-xs text-red-400">{saveError}</p>
                 )}
+                {promoteMessage && (
+                  <p className="mt-1 text-xs text-emerald-400">
+                    {promoteMessage}
+                  </p>
+                )}
+                {promoteError && (
+                  <p className="mt-1 text-xs text-red-400">
+                    {promoteError}
+                  </p>
+                )}
+
+                {disableMessage && (
+  <p className="mt-1 text-xs text-neutral-400">{disableMessage}</p>
+)}
+{disableError && (
+  <p className="mt-1 text-xs text-red-400">{disableError}</p>
+)}
+
               </div>
             </section>
 
-            {/* RECENT EVENTS WITH FILTERS + PAGINATION */}
+            {/* RECENT EVENTS */}
             <section className="mb-10 space-y-3">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
@@ -616,7 +823,6 @@ export default function DashboardPage() {
                 </table>
               </div>
 
-              {/* Pagination Controls */}
               <div className="flex items-center justify-between text-xs text-neutral-500">
                 <span>
                   Showing{" "}
