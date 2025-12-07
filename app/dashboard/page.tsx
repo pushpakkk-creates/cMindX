@@ -118,6 +118,11 @@ export default function DashboardPage() {
   const [events, setEvents] = useState<AnalyticsEvent[]>([]);
   const [loading, setLoading] = useState(true);
 
+
+  // AUTO MODE STATE
+  const [autoMode, setAutoMode] = useState(false);
+  const [savingAutoMode, setSavingAutoMode] = useState(false);
+
   const [agentLoading, setAgentLoading] = useState(false);
   const [agentData, setAgentData] = useState<AgentResponse | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -135,6 +140,12 @@ export default function DashboardPage() {
   const [disableMessage, setDisableMessage] = useState<string | null>(null);
   const [disableError, setDisableError] = useState<string | null>(null);
 
+  const [landingGenerating, setLandingGenerating] = useState(false);
+  const [landingSlug, setLandingSlug] = useState<string | null>(null);
+  const [landingError, setLandingError] = useState<string | null>(null);
+
+  const [landingSpec, setLandingSpec] = useState(null);
+  const [landingLoading, setLandingLoading] = useState(false);
 
   // filters + pagination for events
   const [filterType, setFilterType] = useState<string>("all");
@@ -185,7 +196,9 @@ export default function DashboardPage() {
       setPromoteMessage(null);
       setPromoteError(null);
 
-      const res = await fetch("/api/agent");
+const res = await fetch("/api/agent", {
+  method: "POST",
+});
       const json: AgentResponse = await res.json();
 
       if (!res.ok || !json.ok) throw new Error("Agent returned error");
@@ -262,6 +275,59 @@ export default function DashboardPage() {
       setPromoting(false);
     }
   }
+async function runLandingAgent() {
+  try {
+    setLandingLoading(true);
+
+    const res = await fetch("/api/landing-agent", { method: "POST" });
+    const json = await res.json();
+
+    if (!res.ok || !json.ok) {
+      alert("Failed to generate landing build");
+      return;
+    }
+
+    setLandingSpec(json.spec);
+    console.log("Generated landing spec:", json.spec);
+
+  } catch (err) {
+    console.error(err);
+    alert("Error generating landing page");
+  } finally {
+    setLandingLoading(false);
+  }
+}
+
+
+async function promoteLanding() {
+  if (!landingSpec) {
+    alert("Generate a landing build first!");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/promote-landing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec: landingSpec })
+    });
+
+    const json = await res.json();
+
+    if (!json.ok) {
+      alert("Failed to promote landing build: " + json.error);
+      return;
+    }
+
+    alert("Landing Build promoted! Homepage will now use AI content.");
+
+   
+  window.location.href = "/";
+  }catch (err) {
+    console.error(err);
+    alert("Error promoting landing build");
+  }
+}
 
 
 async function disableLiveVariants() {
@@ -617,14 +683,121 @@ async function disableLiveVariants() {
 
                   {savedVariantId && (
                     <button
-                      onClick={promoteLastSavedVariant}
-                      disabled={promoting}
-                      className="inline-flex items-center justify-center rounded-full border border-emerald-300 bg-emerald-300 px-4 py-1.5 text-[11px] font-medium text-emerald-950 hover:bg-emerald-200 disabled:opacity-60"
-                    >
-                      {promoting ? "Promoting…" : "Promote to live"}
-                    </button>
+  onClick={async () => {
+    try {
+      if (!agentData || !agentData.suggestedVariant) return;
+
+      const res = await fetch("/api/promote-variant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          variant: agentData.suggestedVariant,
+          variantId: agentData.suggestedVariant.fromVariant || "build-c",
+        }),
+      });
+
+      const json = await res.json();
+      console.log("Promote response:", json);
+
+      if (!json.ok) {
+        alert("Failed to promote variant: " + json.error);
+        return;
+      }
+
+      alert("Promoted to live variant!");
+    } catch (err) {
+      console.error(err);
+      alert("Error promoting variant");
+    }
+  }}
+>
+  Promote to live
+</button>
+
                   )}
                 </div>
+
+<div className="mt-10 rounded-xl border border-neutral-800 p-5">
+  <h3 className="text-lg font-semibold text-neutral-200">
+    🧪 Experimental Landing Build (AI-generated)
+  </h3>
+  <p className="text-sm text-neutral-400 mt-2">
+    Generate a complete landing page (Build C) using Gemini, based on live analytics.
+  </p>
+
+  <button
+    onClick={runLandingAgent}
+    className="mt-4 rounded-md bg-neutral-100 text-neutral-900 px-4 py-2 font-medium"
+  >
+    {landingLoading ? "Generating…" : "Generate Landing Build C"}
+  </button>
+
+  {landingSpec && (
+    <div className="mt-4 text-xs text-neutral-400">
+      <pre className="bg-neutral-900 p-3 rounded-lg overflow-auto max-h-60">
+        {JSON.stringify(landingSpec, null, 2)}
+      </pre>
+
+      <button
+        onClick={promoteLanding}
+        className="mt-4 rounded-md border border-neutral-600 px-4 py-2 text-neutral-200"
+      >
+        Save & Promote Landing Build
+      </button>
+    </div>
+  )}
+</div>
+
+
+                {/* AUTO MODE BLOCK */}
+<section className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4 mb-6">
+  <div className="flex items-center justify-between">
+    <div>
+      <h3 className="text-sm font-semibold text-neutral-100">
+        Agent Auto Mode
+      </h3>
+      <p className="text-xs text-neutral-400">
+        When enabled, the agent will automatically deploy new variants
+        without manual approval.
+      </p>
+    </div>
+
+    <button
+      onClick={async () => {
+        try {
+          setSavingAutoMode(true);
+          setAutoMode(!autoMode);
+
+          // update to Firestore
+          await fetch("/api/auto-mode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ autoMode: !autoMode }),
+          });
+        } catch (e) {
+          console.error(e);
+        } finally {
+          setSavingAutoMode(false);
+        }
+      }}
+      className={`px-4 py-1.5 rounded-full text-xs font-medium border ${
+        autoMode
+          ? "bg-green-500/20 border-green-400 text-green-300"
+          : "bg-neutral-800 border-neutral-700 text-neutral-300"
+      }`}
+      disabled={savingAutoMode}
+    >
+      {savingAutoMode ? "Saving..." : autoMode ? "ON" : "OFF"}
+    </button>
+  </div>
+
+  {autoMode && (
+    <p className="mt-2 text-[11px] text-green-400">
+      ✓ Agent can now automatically promote winning variants.
+    </p>
+  )}
+</section>
+
 
                   <section className="space-y-3">
   <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
@@ -689,6 +862,71 @@ async function disableLiveVariants() {
       <p className="mt-2 text-xs text-red-400">{personaError}</p>
     )}
   </div>
+
+
+  <section className="space-y-3">
+  <h2 className="text-xs font-semibold uppercase tracking-[0.16em] text-neutral-500">
+    Experimental landing builds
+  </h2>
+
+  <div className="rounded-xl border border-neutral-800 bg-neutral-950/80 p-4 text-sm">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <p className="text-sm font-medium text-neutral-200">
+          Generate a new landing Build from live data
+        </p>
+        <p className="text-xs text-neutral-500">
+          Uses the same analytics loop to design a full new landing page variant (Build C, D, …).
+        </p>
+      </div>
+
+      <button
+        onClick={async () => {
+          try {
+            setLandingGenerating(true);
+            setLandingError(null);
+            setLandingSlug(null);
+
+            const res = await fetch("/api/landing-page", { method: "POST" });
+            const json = await res.json();
+
+            if (!json.ok) {
+              throw new Error(json.error || "Failed");
+            }
+
+            setLandingSlug(json.slug);
+          } catch (err) {
+            console.error(err);
+            setLandingError("Failed to generate landing build.");
+          } finally {
+            setLandingGenerating(false);
+          }
+        }}
+        disabled={landingGenerating}
+        className="inline-flex items-center justify-center rounded-full border border-neutral-200 bg-neutral-50 px-4 py-1.5 text-[11px] font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-60"
+      >
+        {landingGenerating ? "Generating…" : "Generate landing Build"}
+      </button>
+    </div>
+
+    {landingSlug && (
+      <p className="mt-2 text-xs text-neutral-400">
+        Landing build created:{" "}
+        <a
+          href={`/build/${landingSlug}`}
+          className="text-neutral-100 underline underline-offset-2"
+        >
+          /build/{landingSlug}
+        </a>
+      </p>
+    )}
+
+    {landingError && (
+      <p className="mt-2 text-xs text-red-400">{landingError}</p>
+    )}
+  </div>
+</section>
+
 </section>
 
                 {/* Disable Live AI Copy */}

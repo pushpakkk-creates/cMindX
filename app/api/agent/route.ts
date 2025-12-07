@@ -1,231 +1,236 @@
-// app/api/agent/route.ts
 import { NextResponse } from "next/server";
-import { db } from "../../../lib/firebase";
-import { collection, getDocs, limit, query } from "firebase/firestore";
-import { getAiModel } from "../../../lib/ai";
-
-type VariantId = "A" | "B";
+import { db } from "@/lib/firebase";
+import {
+  collection,
+  getDocs,
+  orderBy,
+  limit,
+  query,
+} from "firebase/firestore";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 type AnalyticsEvent = {
   sessionId: string;
   eventType: string;
-  payload: Record<string, unknown>;
+  payload: Record<string, any>;
   ts: string;
   variantId?: string;
 };
 
-type SimpleStats = {
-  variantId: VariantId;
-  avgScroll: number | null;
+type VariantStats = {
+  variantId: string;
+  avgScroll: number;
   clicks: number;
 };
 
-type AgentVariantSuggestion = {
-  fromVariant: VariantId;
+type SuggestedVariant = {
+  fromVariant: string;
   heroTitle: string;
   heroSubtitle: string;
   primaryCta: string;
   secondaryCta: string;
   badge: string;
-  meta: {
-    basedOn: SimpleStats | null;
-    explanation: string;
-  };
+  meta?: any;
 };
 
-// ---------- UTIL: compute stats from events ----------
-
-async function getSimpleStats(): Promise<SimpleStats[]> {
-  const q = query(collection(db, "events"), limit(500));
-  const snap = await getDocs(q);
-  const events = snap.docs.map((d) => d.data() as any) as AnalyticsEvent[];
-
-  const byVariant: Record<VariantId, AnalyticsEvent[]> = { A: [], B: [] };
-
-  for (const e of events) {
-    const v = (e.variantId as VariantId | undefined) ?? "A";
-    if (v === "A" || v === "B") {
-      byVariant[v].push(e);
-    }
-  }
-
-  const result: SimpleStats[] = [];
-
-  for (const variantId of ["A", "B"] as VariantId[]) {
-    const ve = byVariant[variantId];
-
-    if (ve.length === 0) {
-      result.push({ variantId, avgScroll: null, clicks: 0 });
-      continue;
-    }
-
-    const scrollEvents = ve.filter((e) => e.eventType === "scroll");
-    const scrollPercents = scrollEvents
-      .map((e) => e.payload.scrollPercent as number | undefined)
-      .filter((v): v is number => typeof v === "number");
-
-    const avgScroll =
-      scrollPercents.length > 0
-        ? scrollPercents.reduce((sum, v) => sum + v, 0) /
-          scrollPercents.length
-        : null;
-
-    const clicks = ve.filter((e) => e.eventType === "click").length;
-
-    result.push({ variantId, avgScroll, clicks });
-  }
-
-  return result;
+function parseJson(text: string) {
+  let clean = text.trim();
+  clean = clean
+    .replace(/^```json/, "")
+    .replace(/^```/, "")
+    .replace(/```$/, "")
+    .trim();
+  return JSON.parse(clean);
 }
 
-// ---------- MOCK AGENT (current behaviour) ----------
+// Simple heuristic winner if Gemini fails
+function buildMockSuggestion(stats: VariantStats[]): {
+  suggestedVariant: SuggestedVariant;
+  aiUsed: "mock";
+  aiError?: string;
+} {
+  if (stats.length === 0) {
+    const suggestedVariant: SuggestedVariant = {
+      fromVariant: "A",
+      heroTitle: "SELF-EVOLVING WEBSITE // BUILD C",
+      heroSubtitle:
+        "New variant evolved from the current winner, tuned to push visitors deeper into the page and increase interaction based on live analytics.",
+      primaryCta: "▶ Deploy Build C",
+      secondaryCta: "◎ Inspect experiment logs",
+      badge: "AGENT MODE • EVOLUTION",
+      meta: {
+        basedOn: null,
+        explanation:
+          "Mock agent: assumes that high scroll + clicks correlate with better engagement.",
+      },
+    };
+    return { suggestedVariant, aiUsed: "mock" };
+  }
 
-function pickWinner(stats: SimpleStats[]): SimpleStats | null {
-  if (stats.length === 0) return null;
+  // Score: avgScroll + 10 * clicks
+  const withScore = stats.map((s) => ({
+    ...s,
+    score: s.avgScroll + 10 * s.clicks,
+  }));
+  withScore.sort((a, b) => b.score - a.score);
+  const winner = withScore[0];
 
-  return stats.reduce((best, cur) => {
-    const bestScore = (best.avgScroll ?? 0) + best.clicks * 2;
-    const curScore = (cur.avgScroll ?? 0) + cur.clicks * 2;
-    return curScore > bestScore ? cur : best;
-  });
-}
-
-function mockGenerateVariant(stats: SimpleStats[]): AgentVariantSuggestion {
-  const winner = pickWinner(stats);
-  const base = winner?.variantId ?? "A";
-
-  return {
-    fromVariant: base,
-    heroTitle:
-      base === "A"
-        ? "SELF-EVOLVING WEBSITE // BUILD C"
-        : "AUTONOMOUS GROWTH AGENT // BUILD C",
+  const suggestedVariant: SuggestedVariant = {
+    fromVariant: winner.variantId,
+    heroTitle: "AUTONOMOUS GROWTH AGENT // BUILD C",
     heroSubtitle:
-      "New variant evolved from the current winner, tuned to push players deeper into the page and increase interaction based on live analytics.",
+      "New variant evolved from the current winning variant, tuned from live scroll and click behaviour to drive deeper engagement.",
     primaryCta: "▶ Deploy Build C",
     secondaryCta: "◎ Inspect experiment logs",
     badge: "AGENT MODE • EVOLUTION",
     meta: {
-      basedOn: winner ?? null,
+      basedOn: winner,
       explanation:
-        "Mock agent: uses heuristic score (scroll depth + clicks) to evolve a new Build C from the current winning variant."
-    }
+        "Mock agent: uses a heuristic score (avg scroll + 10×clicks) to choose the best-performing variant and then proposes Build C from it.",
+    },
   };
+
+  return { suggestedVariant, aiUsed: "mock" };
 }
 
-// ---------- GEMINI-POWERED AGENT (with safe fallback) ----------
+export async function POST() {
+  try {
+    // 1) Load recent events
+    const snap = await getDocs(
+      query(collection(db, "events"), orderBy("ts", "desc"), limit(500))
+    );
 
-async function generateVariantWithGemini(
-  stats: SimpleStats[]
-): Promise<AgentVariantSuggestion> {
-  const model = getAiModel();
-  if (!model) {
-    throw new Error("No Gemini model available");
-  }
+    const events: AnalyticsEvent[] = snap.docs.map((d) => d.data() as any);
 
-  const statsJson = JSON.stringify(stats, null, 2);
+    if (events.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "Not enough events yet." },
+        { status: 400 }
+      );
+    }
 
-  const prompt = `
-You are an expert SaaS landing-page copywriter for a product called cMindX
-that automatically rewrites websites based on live analytics.
+    // 2) Aggregate stats per variantId (A/B)
+    const byVariant: Record<
+      string,
+      { scrolls: number[]; clicks: number; count: number }
+    > = {};
 
-We have two variants A and B. For each we tracked:
-- avgScroll (roughly attention / depth)
-- clicks (CTA / link interactions)
+    for (const e of events) {
+      const vId = e.variantId || "unknown";
+      if (!byVariant[vId]) {
+        byVariant[vId] = { scrolls: [], clicks: 0, count: 0 };
+      }
 
-Here are the aggregated stats per variant (JSON):
+      if (e.eventType === "scroll") {
+        const val = Number(e.payload.scrollPercent ?? 0);
+        if (!Number.isNaN(val)) {
+          byVariant[vId].scrolls.push(val);
+        }
+      }
 
-${statsJson}
+      if (e.eventType === "click") {
+        byVariant[vId].clicks += 1;
+      }
 
-Task:
-Generate a NEW hero variant called "Build C" that should improve engagement
-(higher scroll) and intent (more clicks).
+      byVariant[vId].count += 1;
+    }
 
-Return ONLY valid JSON with this exact shape:
+    const stats: VariantStats[] = Object.entries(byVariant).map(
+      ([variantId, agg]) => {
+        const avgScroll =
+          agg.scrolls.length > 0
+            ? agg.scrolls.reduce((a, b) => a + b, 0) / agg.scrolls.length
+            : 0;
+        return {
+          variantId,
+          avgScroll,
+          clicks: agg.clicks,
+        };
+      }
+    );
+
+    // 3) Try Gemini first, fallback to mock
+    let suggestedVariant: SuggestedVariant;
+    let aiUsed: "mock" | "gemini" = "mock";
+    let aiError: string | undefined;
+
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (apiKey) {
+      try {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({
+          model: "gemini-2.5-flash",
+        });
+
+        const prompt = `
+You are optimizing a landing page for a product called cMindX.
+
+You get aggregated A/B stats:
+${JSON.stringify(stats, null, 2)}
+
+Pick the best-performing variantId and propose a new "Build C" hero variant based on it.
+
+Return ONLY JSON, no markdown, with this shape:
 
 {
-  "heroTitle": "ONE LINE, in ALL CAPS or with symbols like // or ▶, game/HUD vibe",
-  "heroSubtitle": "2–3 short lines, clear value of cMindX and how it works",
-  "primaryCta": "Short button label, ideally starting with a symbol like ▶",
-  "secondaryCta": "Short safety-net action label (e.g., '◎ Watch experiments')",
-  "badge": "Short ALL CAPS label, e.g. 'AGENT MODE • EVOLUTION'"
+  "fromVariant": "A",
+  "heroTitle": "SELF-EVOLVING WEBSITE // BUILD C",
+  "heroSubtitle": "1-2 sentence explanation tuned from the stats.",
+  "primaryCta": "Primary button label",
+  "secondaryCta": "Secondary button label",
+  "badge": "Short label, e.g. AGENT MODE • EVOLUTION",
+  "meta": {
+    "basedOn": { "variantId": "...", "avgScroll": 0, "clicks": 0 },
+    "explanation": "Short explanation of how behaviour informed this variant."
+  }
 }
-
-No extra text, no comments, no markdown fences.
 `;
 
-  const result = await model.generateContent(prompt);
-  const text = result.response.text().trim();
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        const parsed = parseJson(text);
 
-  // Clean possible ```json ... ``` wrappers
-  const cleaned = text
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
-
-  let parsed: {
-    heroTitle: string;
-    heroSubtitle: string;
-    primaryCta: string;
-    secondaryCta: string;
-    badge: string;
-  };
-
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (e) {
-    console.error("Failed to parse Gemini JSON, raw text:", text);
-    throw e;
-  }
-
-  const winner = pickWinner(stats);
-
-  return {
-    fromVariant: winner?.variantId ?? "A",
-    heroTitle: parsed.heroTitle,
-    heroSubtitle: parsed.heroSubtitle,
-    primaryCta: parsed.primaryCta,
-    secondaryCta: parsed.secondaryCta,
-    badge: parsed.badge,
-    meta: {
-      basedOn: winner ?? null,
-      explanation:
-        "Gemini-generated Build C: based on live stats (avg scroll + clicks) to increase engagement and interaction."
-    }
-  };
-}
-
-// ---------- API HANDLER ----------
-
-export async function GET() {
-  try {
-    const stats = await getSimpleStats();
-
-    let suggestedVariant: AgentVariantSuggestion;
-    let usedAI = false;
-    let aiError: string | null = null;
-
-    // Try Gemini first; if anything fails, fall back to mock agent
-    try {
-      suggestedVariant = await generateVariantWithGemini(stats);
-      usedAI = true;
-    } catch (e: any) {
-      console.error("Gemini agent failed, falling back to mock heuristic.", e);
-      aiError = String(e);
-      suggestedVariant = mockGenerateVariant(stats);
+        // minimal validation
+        if (
+          parsed.heroTitle &&
+          parsed.heroSubtitle &&
+          parsed.primaryCta &&
+          parsed.secondaryCta
+        ) {
+          suggestedVariant = parsed;
+          aiUsed = "gemini";
+        } else {
+          const mock = buildMockSuggestion(stats);
+          suggestedVariant = mock.suggestedVariant;
+          aiUsed = mock.aiUsed;
+          aiError = "Gemini returned incomplete JSON, used mock heuristic.";
+        }
+      } catch (err: any) {
+        console.error("Gemini error:", err);
+        const mock = buildMockSuggestion(stats);
+        suggestedVariant = mock.suggestedVariant;
+        aiUsed = mock.aiUsed;
+        aiError = String(err?.message || "Gemini call failed");
+      }
+    } else {
+      const mock = buildMockSuggestion(stats);
+      suggestedVariant = mock.suggestedVariant;
+      aiUsed = mock.aiUsed;
+      aiError = "Missing GEMINI_API_KEY, using mock heuristic.";
     }
 
     return NextResponse.json({
       ok: true,
       stats,
       suggestedVariant,
-      aiUsed: usedAI ? "gemini" : "mock",
-      aiError
+      aiUsed,
+      aiError,
     });
-  } catch (e) {
-    console.error("Agent route fatal error", e);
+  } catch (e: any) {
+    console.error("agent route error:", e);
     return NextResponse.json(
-      { ok: false, error: String(e) },
+      { ok: false, error: e.message || "Unknown error in agent." },
       { status: 500 }
     );
   }
