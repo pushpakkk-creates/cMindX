@@ -94,9 +94,15 @@ const DEFAULT_SPEC: LandingPageSpec = {
 };
 
 export default function Home() {
+
+  const [landingContent, setLandingContent] = useState<any>(null);
+
   const [variantId, setVariantId] = useState<VariantId>("A");
   const [spec, setSpec] = useState<LandingPageSpec | null>(null);
   const [usingAiSpec, setUsingAiSpec] = useState(false);
+
+  const [usingAiLanding, setUsingAiLanding] = useState(false);
+  const [activeLandingSlug, setActiveLandingSlug] = useState<string | null>(null);
 
   // A/B assignment for analytics
   useEffect(() => {
@@ -107,22 +113,24 @@ export default function Home() {
   useAnalytics(variantId);
 
   // Fetch active landing spec
-  useEffect(() => {
-    async function loadSpec() {
-      try {
-        const res = await fetch("/api/active-landing");
-        if (!res.ok) return;
-        const json = await res.json();
-        if (json.ok && json.spec) {
-          setSpec(json.spec as LandingPageSpec);
-          setUsingAiSpec(true);
-        }
-      } catch (e) {
-        console.error("active-landing fetch error", e);
+useEffect(() => {
+  async function loadLanding() {
+    try {
+      const res = await fetch("/api/active-landing");
+      const json = await res.json();
+
+      if (json.ok && json.spec) {
+        setUsingAiLanding(true);
+        setActiveLandingSlug(json.slug);
+        setLandingContent(json.spec); // <-- NEW: store AI hero content
       }
+    } catch (e) {
+      console.error("active landing load failed", e);
     }
-    loadSpec();
-  }, []);
+  }
+
+  loadLanding();
+}, []);
 
   const page = spec ?? DEFAULT_SPEC;
 
@@ -161,6 +169,22 @@ export default function Home() {
             </a>
           </nav>
         </div>
+
+        {usingAiLanding && (
+  <div className="border-b border-emerald-600/40 bg-emerald-900/20">
+    <div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-2 text-[11px] text-emerald-200 md:px-8">
+      <span className="font-medium tracking-[0.16em] uppercase">
+        AI Landing Build Active
+      </span>
+      <span className="text-emerald-300/90">
+        {activeLandingSlug
+          ? `Now serving: ${activeLandingSlug}`
+          : "Now serving: Build C"}
+      </span>
+    </div>
+  </div>
+)}
+
       </header>
 
       {/* MAIN */}
@@ -174,8 +198,10 @@ export default function Home() {
             </p>
 
             <h1 className="text-4xl font-semibold leading-tight tracking-tight text-neutral-50 md:text-5xl">
-              {page.hero.title}
-            </h1>
+  {landingContent?.heroTitle || 
+    "A landing page that rewrites itself from live behaviour."}
+</h1>
+
 
             <p className="max-w-xl text-sm leading-relaxed text-neutral-300 md:text-[15px]">
               {page.hero.subtitle}
